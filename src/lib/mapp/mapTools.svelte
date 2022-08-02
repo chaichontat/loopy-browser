@@ -1,77 +1,65 @@
 <script lang="ts">
+  import { classes, tooltip } from '$lib/utils';
   import Colorbar from '$src/lib/components/colorbar.svelte';
   import type { Mapp } from '$src/lib/mapp/mapp';
   import SelectionBox from '$src/lib/mapp/selectionBox.svelte';
   import { oneLRU } from '$src/lib/utils';
   import { onMount } from 'svelte';
-  import type { PlainJSON } from '../data/features';
-  import { activeFeatures, activeSample, samples } from '../store';
+  import type { Sample } from '../data/sample';
+  import { annotating, samples, sFeature, sOverlay } from '../store';
   import type { Draww } from './selector';
 
+  export let sample: Sample | undefined;
   export let map: Mapp;
-  export let selecting: boolean;
   export let showImgControl: boolean;
   export let colorbar = true;
   export let width = 0;
   let draw: Draww | undefined;
+  let selecting = false;
 
   onMount(async () => {
     await map.promise;
     map.draw!.draw.on('drawend', () => (selecting = false));
-    map.draw!.source.on('addfeature', (evt) => {
-      if (!evt.feature!.get('name')) {
-        const name = prompt('Name of selection');
-        map.draw!.setPolygonName(-1, name ?? 'Selection');
-      }
-      updateSelection();
-    });
     draw = map.draw;
   });
 
-  let selectionNames: string[] = [];
-  function updateSelectionNames() {
-    selectionNames = map.draw?.getPolygonsName() ?? [];
-  }
-  function updateSelectionPoints() {
-    if (!map.mounted) return;
-    const names = map.draw?.getPolygonsName() ?? [];
-    const arr = ($samples[$activeSample].features._selections as PlainJSON).values as string[];
-    arr.fill('');
-    for (const [i, n] of names.entries()) {
-      map.draw!.getPoints(i).forEach((p) => (arr[p] = n));
+  // Enable/disable polygon draw
+  $: if (map.map && map.draw) {
+    if (selecting) {
+      if ($annotating.currKey === null) {
+        alert('Set annotation name first');
+        selecting = false;
+      } else {
+        map.map?.addInteraction(map.draw.draw);
+        map.map.getViewport().style.cursor = 'crosshair';
+      }
+    } else {
+      map.map.removeInteraction(map.draw.draw);
+      map.map.getViewport().style.cursor = 'grab';
     }
   }
 
-  function updateSelection() {
-    updateSelectionNames();
-    updateSelectionPoints();
-  }
-
+  let selectionNames: string[] = [];
   let colorOpacity = 1;
 
   const setVisible = (name: string, c: boolean | null) =>
-    map.layerMap[name]?.layer?.setVisible(c ?? false);
+    map.layers[name]?.layer?.setVisible(c ?? false);
 
   const setOpacity = oneLRU(async (name: string, opacity: string) => {
-    await map.layerMap[name]?.promise;
-    if (name === 'spots') colorOpacity = Number(opacity);
-    map.layerMap[name]?.layer!.updateStyleVariables({ opacity: Number(opacity) });
+    await map.layers[name]?.promise;
+    colorOpacity = Number(opacity);
+    map.layers[name]?.layer!.updateStyleVariables({ opacity: Number(opacity) });
   });
 
   // TODO: Use makedownload.
   function handleExport(t: 'spots' | 'selections') {
-    if (!map.mounted) return;
+    if (!map.mounted || !sample) return;
     switch (t) {
       case 'selections':
-        toJSON(
-          draw!.dumpPolygons(),
-          `selections_${$activeSample}.json`,
-          'selections',
-          $activeSample
-        );
+        toJSON(draw!.dumpPolygons(), `selections_${sample.name}.json`, 'selections', sample.name);
         break;
       case 'spots':
-        toJSON(draw!.dumpAllPoints(), `spots_${$activeSample}.json`, 'spots', $activeSample);
+        toJSON(draw!.dumpAllPoints(), `spots_${sample.name}.json`, 'spots', sample.name);
         break;
       default:
         throw new Error('Unknown export type');
@@ -103,7 +91,7 @@
       if (parsed.type !== 'selections') {
         alert('Not a polygon. Make sure that you have the correct file.');
       }
-      if (parsed.sample !== $activeSample) {
+      if (parsed.sample !== sample?.name) {
         alert('Sample does not match.');
       }
 
@@ -140,23 +128,10 @@
       <SelectionBox
         names={selectionNames}
         on:hover={(evt) => map.draw?.highlightPolygon(evt.detail.i)}
-        on:delete={(evt) => {
-          map.draw?.deletePolygon(evt.detail.i);
-          updateSelection();
-        }}
-        on:clearall={() => {
-          map.draw?.clear();
-          updateSelection();
-        }}
+        on:delete={(evt) => map.draw?.deletePolygon(evt.detail.i)}
+        on:clearall={() => map.draw?.clear()}
         on:export={(evt) => handleExport(evt.detail.name)}
         on:import={(evt) => fromJSON(evt.detail.e).catch(console.error)}
-        on:rename={(evt) => {
-          const newName = prompt('Enter new selection name.');
-          if (newName) {
-            draw?.setPolygonName(evt.detail.i, newName);
-            updateSelection();
-          }
-        }}
       />
       <button
         class="rounded-lg bg-sky-600/80 px-2 py-1 text-sm text-white shadow backdrop-blur transition-all hover:bg-sky-600/80 active:bg-sky-500/80 dark:bg-sky-600/90 dark:text-slate-200 dark:hover:bg-sky-600"
@@ -180,53 +155,75 @@
     {/if}
   </div>
 
-  <!-- Spots -->
+  <!-- Overlay selector -->
   {#if showImgControl}
     <div
       class="inline-flex flex-col gap-y-1 rounded-lg bg-slate-100/80 p-2 px-3 text-sm font-medium backdrop-blur transition-all hover:bg-slate-200 dark:bg-neutral-600/90 dark:text-white/90 dark:hover:bg-neutral-600"
     >
-      <table>
-        {#each Object.keys($samples[$activeSample].overlays) as ovName}
-          <tr class="flex">
-            <td class="flex gap-x-1 pr-2">
-              <label class="flex cursor-pointer items-center gap-x-1">
+      <table class="table-fixed">
+        {#if sample}
+          {#each Object.keys($samples[sample.name].overlays) as ovName}
+            <tr>
+              <td class="flex gap-x-1 pr-2">
+                <!-- Outline checkbox -->
                 <input
                   type="checkbox"
-                  class="mr-0.5 cursor-pointer bg-opacity-80"
+                  class="mr-0.5 cursor-pointer items-center gap-x-1 bg-opacity-80"
+                  use:tooltip={{ content: 'Border' }}
                   checked
                   on:change={(e) =>
-                    map.layerMap['outlines']?.layer?.setVisible(e.currentTarget.checked ?? false)}
+                    map.layers[ovName]?.outline?.layer?.setVisible(
+                      e.currentTarget.checked ?? false
+                    )}
                 />
-              </label>
-              <label class="flex cursor-pointer items-center gap-x-1">
+
+                <!-- Fill checkbox -->
                 <input
                   type="checkbox"
-                  class="mr-0.5 cursor-pointer bg-opacity-80"
+                  class="mr-0.5 cursor-pointer items-center gap-x-1 bg-opacity-80"
                   checked
+                  use:tooltip={{ content: 'Fill' }}
                   on:change={(e) => setVisible(ovName, e.currentTarget.checked ?? false)}
                 />
-                <span class="max-w-[10rem] select-none text-ellipsis capitalize">{ovName}</span>
-              </label>
-            </td>
 
-            <td class="pr-3 text-yellow-400">
-              {$activeFeatures[ovName]?.name ?? 'None'}
-            </td>
+                <!-- Overlay name -->
+                <span
+                  on:click={() => ($sOverlay = ovName)}
+                  class={classes(
+                    'max-w-[10rem] cursor-pointer select-none text-ellipsis capitalize',
+                    $sOverlay === ovName ? 'text-white' : 'text-white/70'
+                  )}>{ovName}</span
+                >
+              </td>
 
-            <td>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                value="0.9"
-                step="0.01"
-                on:change={(e) => setOpacity(ovName, e.currentTarget.value)}
-                on:mousemove={(e) => setOpacity(ovName, e.currentTarget.value)}
-                class="max-w-[5rem] translate-y-[2px] cursor-pointer opacity-80"
-              />
-            </td>
-          </tr>
-        {/each}
+              <!-- Feature name -->
+              <td
+                on:click={() => ($sOverlay = ovName)}
+                class={classes(
+                  'min-w-[4rem] cursor-pointer pr-3',
+                  $sOverlay === ovName ? 'text-yellow-300' : 'text-yellow-300/70'
+                )}
+              >
+                {$sFeature[ovName]?.feature ?? 'None'}
+              </td>
+
+              <!-- Opacity bar -->
+              <td>
+                <input
+                  type="range"
+                  min="0"
+                  max="1"
+                  value="0.9"
+                  step="0.01"
+                  on:change={(e) => setOpacity(ovName, e.currentTarget.value)}
+                  on:mousemove={(e) => setOpacity(ovName, e.currentTarget.value)}
+                  use:tooltip={{ content: 'Opacity' }}
+                  class="max-w-[5rem] translate-y-[2px] cursor-pointer opacity-80"
+                />
+              </td>
+            </tr>
+          {/each}
+        {/if}
       </table>
     </div>
   {/if}
